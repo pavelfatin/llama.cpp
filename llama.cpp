@@ -1388,15 +1388,10 @@ struct llama_mmap {
         *ptr = *ptr & ~(page_size - 1);
     }
 
-    virtual void populate(size_t first, size_t last) const {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
-
-        // either already populated or populated dynamically
-    }
-
 #ifdef _POSIX_MAPPED_FILES
     static constexpr bool SUPPORTED = true;
+
+    bool numa;
 
     // list of mapped fragments (first_offset, last_offset)
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -1404,30 +1399,20 @@ struct llama_mmap {
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1 /* -1 = max value */, bool numa = false) {
         size = file->size;
         this->prefetch = prefetch > 0;
+        this->numa = numa;
         int fd = fileno(file->fp);
-        int flags = MAP_SHARED;
-        // prefetch/readahead impairs performance on NUMA systems
-        if (numa)  { prefetch = 0; }
 #ifdef __linux__
         // advise the kernel to read the file sequentially (increases readahead)
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
 #endif
-        addr = mmap(NULL, file->size, PROT_READ, flags, fd, 0);
+        addr = mmap(NULL, file->size, PROT_READ, MAP_SHARED, fd, 0);
         if (addr == MAP_FAILED) { // NOLINT
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        if (prefetch > 0) {
-            // advise the kernel to preload the mapped memory
-            if (posix_madvise(addr, std::min(file->size, prefetch), POSIX_MADV_WILLNEED)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
-                        strerror(errno));
-            }
-        }
         if (numa) {
             // advise the kernel not to use readahead
             // (because the next page might not belong on the same node)
@@ -1439,6 +1424,25 @@ struct llama_mmap {
 
         // initialize list of mapped_fragments
         mapped_fragments.emplace_back(0, file->size);
+    }
+
+    virtual void populate(size_t first, size_t last) const {
+        // prefetch/readahead impairs performance on NUMA systems
+        if (!numa) {
+            int page_size = sysconf(_SC_PAGESIZE);
+            align_to_previous_page(&first, page_size);
+            align_to_next_page(&last, page_size);
+#ifdef __linux__
+            if (madvise((char *) addr + first, last - first, MADV_POPULATE_READ)) {
+                LLAMA_LOG_WARN("warning: madvise(.., MADV_POPULATE_READ) failed: %s\n", strerror(errno));
+            }
+#else
+            // advise the kernel to preload the mapped memory
+            if (posix_madvise((char *) addr + first, last - first, POSIX_MADV_WILLNEED)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
+            }
+#endif
+        }
     }
 
     // partially unmap the file in the range [first, last)
@@ -1523,30 +1527,30 @@ struct llama_mmap {
         if (addr == NULL) {
             throw std::runtime_error(format("MapViewOfFile failed: %s", llama_format_win_err(error).c_str()));
         }
+    }
 
-        if (prefetch > 0) {
+    virtual void populate(size_t first, size_t last) const {
 #if _WIN32_WINNT >= 0x602
-            // PrefetchVirtualMemory is only present on Windows 8 and above, so we dynamically load it
-            BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        // PrefetchVirtualMemory is only present on Windows 8 and above, so we dynamically load it
+        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
 
-            // may fail on pre-Windows 8 systems
-            pPrefetchVirtualMemory = reinterpret_cast<decltype(pPrefetchVirtualMemory)> (GetProcAddress(hKernel32, "PrefetchVirtualMemory"));
+        // may fail on pre-Windows 8 systems
+        pPrefetchVirtualMemory = reinterpret_cast<decltype(pPrefetchVirtualMemory)> (GetProcAddress(hKernel32, "PrefetchVirtualMemory"));
 
-            if (pPrefetchVirtualMemory) {
-                // advise the kernel to preload the mapped memory
-                WIN32_MEMORY_RANGE_ENTRY range;
-                range.VirtualAddress = addr;
-                range.NumberOfBytes = (SIZE_T) std::min(size, prefetch);
-                if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
-                    LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
-                            llama_format_win_err(GetLastError()).c_str());
-                }
+        if (pPrefetchVirtualMemory) {
+            // advise the kernel to preload the mapped memory
+            WIN32_MEMORY_RANGE_ENTRY range;
+            range.VirtualAddress = (char *) addr + first;
+            range.NumberOfBytes = last - first;
+            if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
+                        llama_format_win_err(GetLastError()).c_str());
             }
-#else
-            throw std::runtime_error("PrefetchVirtualMemory unavailable");
-#endif
         }
+#else
+        throw std::runtime_error("PrefetchVirtualMemory unavailable");
+#endif
     }
 
     virtual void unmap_fragment(size_t first, size_t last) {
@@ -1568,6 +1572,13 @@ struct llama_mmap {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
+
+        throw std::runtime_error("mmap not supported");
+    }
+
+    void populate(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -1687,13 +1698,6 @@ struct llama_anonymous_mmap : llama_mmap {
     llama_anonymous_mmap(struct llama_file * file, bool prefetch) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
-
-        throw std::runtime_error("mmap not supported");
-    }
-
-    void populate(size_t first, size_t last) const override {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
 
         throw std::runtime_error("mmap not supported");
     }
